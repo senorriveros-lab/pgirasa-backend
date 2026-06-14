@@ -6,14 +6,18 @@ con una clave compartida (X-App-Key).
 
 Desplegar en Coolify (ver README.md).
 """
+import base64
 import hashlib
+import hmac
 import os
 import smtplib
+import time
 import urllib.parse
 from datetime import datetime, timedelta, date
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+import bcrypt
 import requests
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
@@ -315,3 +319,189 @@ def datos_sync(body: Sync, x_app_key: str = Header(None)):
     except requests.HTTPError as e:
         raise HTTPException(502, f"Error al sincronizar {body.tabla}: {e}")
     return {"ok": True, "filas": len(body.filas)}
+
+
+# ============================================================
+#  APP MÓVIL (PGIRASAtoolsMobile)
+#  La app móvil solo habla con estos endpoints (sin llaves locales).
+# ============================================================
+TOKEN_TTL_DIAS = 30
+
+# Categorías de residuos RH1 (interna, peligroso?)
+RESIDUOS = [
+    ("no_bolsa_blanca", False), ("no_bolsa_negra", False), ("no_bolsa_verde", False),
+    ("pel_biosanitario", True), ("pel_anatomopatologico", True), ("pel_cortopunzante", True),
+    ("pel_animales", True), ("pel_farmacos", True), ("pel_citotoxicos", True),
+    ("pel_metales", True), ("pel_reactivos", True), ("pel_contenedores", True),
+    ("pel_aceites", True), ("pel_radiactivo", True), ("ap_raee", False),
+]
+RESIDUO_COLS = [c[0] for c in RESIDUOS]
+
+
+def _crear_token(username, role, sede):
+    exp = int(time.time()) + TOKEN_TTL_DIAS * 86400
+    payload = f"{username}|{role}|{sede}|{exp}"
+    sig = hmac.new(APP_API_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(payload.encode()).decode() + "." + sig
+
+
+def _validar_token(token):
+    try:
+        b64, sig = token.split(".", 1)
+        payload = base64.urlsafe_b64decode(b64.encode()).decode()
+        esperado = hmac.new(APP_API_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, esperado):
+            return None
+        username, role, sede, exp = payload.split("|")
+        if int(exp) < int(time.time()):
+            return None
+        return {"username": username, "role": role, "sede": sede}
+    except Exception:
+        return None
+
+
+def _verificar_pwd(pwd, stored):
+    if not stored:
+        return False
+    if stored.startswith("$2"):
+        try:
+            return bcrypt.checkpw(pwd.encode(), stored.encode())
+        except Exception:
+            return False
+    return stored == hashlib.sha256(pwd.encode()).hexdigest()
+
+
+class MovilLogin(BaseModel):
+    nit: str
+    usuario: str
+    password: str
+
+class MovilRegistrar(BaseModel):
+    token: str
+    sede: str
+    fecha: str
+    valores: dict
+    observaciones: str = ""
+
+class MovilToken(BaseModel):
+    token: str
+
+class MovilBloquear(BaseModel):
+    token: str
+    username: str
+    bloquear: bool
+
+
+@app.post("/movil/login")
+def movil_login(body: MovilLogin, x_app_key: str = Header(None)):
+    _auth(x_app_key)
+    nit = body.nit.strip()
+    # Verificar que el NIT corresponde a un cliente registrado
+    cli = _sb("GET", f"clientes?nit=eq.{urllib.parse.quote(nit)}&select=razon_social&limit=1")
+    if not cli:
+        return {"ok": False, "mensaje": "NIT no encontrado."}
+    res = _sb("GET", f"usuarios?username=eq.{urllib.parse.quote(body.usuario.strip())}"
+                     f"&select=username,password_hash,nombre_completo,rol,activo,sede_asignada,bloqueado")
+    if not res:
+        return {"ok": False, "mensaje": "Usuario o contraseña incorrectos."}
+    u = res[0]
+    if not u.get("activo", 1):
+        return {"ok": False, "mensaje": "La cuenta está inactiva."}
+    if u.get("bloqueado"):
+        return {"ok": False, "mensaje": "Cuenta bloqueada. Contacta al administrador."}
+    if not _verificar_pwd(body.password, u.get("password_hash", "")):
+        return {"ok": False, "mensaje": "Usuario o contraseña incorrectos."}
+    sede = u.get("sede_asignada") or ""
+    token = _crear_token(u["username"], u.get("rol", "usuario"), sede)
+    return {"ok": True, "token": token, "rol": u.get("rol", "usuario"),
+            "nombre": u.get("nombre_completo", ""), "sede_asignada": sede,
+            "entidad": cli[0].get("razon_social", "")}
+
+
+@app.post("/movil/sedes")
+def movil_sedes(body: MovilToken, x_app_key: str = Header(None)):
+    _auth(x_app_key)
+    t = _validar_token(body.token)
+    if not t:
+        raise HTTPException(401, "Sesión expirada. Inicia sesión de nuevo.")
+    res = _sb("GET", "sedes?activo=eq.1&select=nombre&order=nombre") or []
+    todas = [r["nombre"] for r in res]
+    if t["sede"]:
+        todas = [s for s in todas if s == t["sede"]]
+    return {"ok": True, "sedes": todas}
+
+
+@app.post("/movil/registrar")
+def movil_registrar(body: MovilRegistrar, x_app_key: str = Header(None)):
+    _auth(x_app_key)
+    t = _validar_token(body.token)
+    if not t:
+        raise HTTPException(401, "Sesión expirada. Inicia sesión de nuevo.")
+    if t["sede"] and t["sede"] != body.sede:
+        return {"ok": False, "mensaje": "No tienes permiso para registrar en esa sede."}
+    try:
+        dt = datetime.strptime(body.fecha, "%Y-%m-%d")
+    except Exception:
+        return {"ok": False, "mensaje": "Fecha inválida."}
+    fila = {"fecha": body.fecha, "anio": dt.year, "mes": dt.month, "dia": dt.day,
+            "sede": body.sede, "responsable": t["username"],
+            "observaciones": body.observaciones}
+    for c in RESIDUO_COLS:
+        fila[c] = float(body.valores.get(c, 0) or 0)
+    try:
+        _sb("POST", "rh1_diario?on_conflict=fecha,sede", data=fila,
+            headers=_sb_headers({"Prefer": "resolution=merge-duplicates,return=minimal"}))
+    except requests.HTTPError as e:
+        raise HTTPException(502, f"No se pudo guardar: {e}")
+    return {"ok": True, "mensaje": f"Residuos del {body.fecha} guardados para {body.sede}."}
+
+
+@app.post("/movil/estadisticas")
+def movil_estadisticas(body: MovilToken, x_app_key: str = Header(None)):
+    _auth(x_app_key)
+    t = _validar_token(body.token)
+    if not t or t["role"] != "admin":
+        raise HTTPException(403, "Solo administradores.")
+    anio = datetime.now().year
+    sel = ",".join(["sede", "fecha"] + RESIDUO_COLS)
+    rows = _sb("GET", f"rh1_diario?anio=eq.{anio}&select={sel}") or []
+    por_sede = {}
+    total_pel = total_nopel = 0.0
+    pelig = {c for c, p in RESIDUOS if p}
+    for r in rows:
+        s = r.get("sede", "") or "(sin sede)"
+        acc = por_sede.setdefault(s, {"peligrosos": 0.0, "no_peligrosos": 0.0, "registros": 0})
+        acc["registros"] += 1
+        for c in RESIDUO_COLS:
+            v = float(r.get(c, 0) or 0)
+            if c in pelig:
+                acc["peligrosos"] += v; total_pel += v
+            else:
+                acc["no_peligrosos"] += v; total_nopel += v
+    return {"ok": True, "anio": anio, "por_sede": por_sede,
+            "total_peligrosos": round(total_pel, 2),
+            "total_no_peligrosos": round(total_nopel, 2),
+            "total_general": round(total_pel + total_nopel, 2)}
+
+
+@app.post("/movil/usuarios")
+def movil_usuarios(body: MovilToken, x_app_key: str = Header(None)):
+    _auth(x_app_key)
+    t = _validar_token(body.token)
+    if not t or t["role"] != "admin":
+        raise HTTPException(403, "Solo administradores.")
+    res = _sb("GET", "usuarios?select=username,nombre_completo,rol,activo,sede_asignada,bloqueado"
+                     "&order=username") or []
+    return {"ok": True, "usuarios": res}
+
+
+@app.post("/movil/bloquear")
+def movil_bloquear(body: MovilBloquear, x_app_key: str = Header(None)):
+    _auth(x_app_key)
+    t = _validar_token(body.token)
+    if not t or t["role"] != "admin":
+        raise HTTPException(403, "Solo administradores.")
+    _sb("PATCH", f"usuarios?username=eq.{urllib.parse.quote(body.username)}",
+        data={"bloqueado": 1 if body.bloquear else 0},
+        headers=_sb_headers({"Prefer": "return=minimal"}))
+    return {"ok": True, "mensaje": ("Usuario bloqueado." if body.bloquear else "Usuario desbloqueado.")}
