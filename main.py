@@ -20,6 +20,7 @@ from email.mime.text import MIMEText
 import bcrypt
 import requests
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 # ── Configuración (variables de entorno en Coolify) ──────────────────────────
@@ -505,3 +506,406 @@ def movil_bloquear(body: MovilBloquear, x_app_key: str = Header(None)):
         data={"bloqueado": 1 if body.bloquear else 0},
         headers=_sb_headers({"Prefer": "return=minimal"}))
     return {"ok": True, "mensaje": ("Usuario bloqueado." if body.bloquear else "Usuario desbloqueado.")}
+
+
+# ============================================================
+#  DASHBOARD Y REPORTES MÓVIL (solo administradores)
+#  Calcula sobre Supabase lo que el escritorio calcula en local:
+#  estadísticas, tendencias, semáforo de cumplimiento e indicadores.
+# ============================================================
+MESES_ES = ["", "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+            "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
+_PELIGROSOS = {c for c, p in RESIDUOS if p}
+
+
+def _num(v):
+    try:
+        return float(v or 0)
+    except Exception:
+        return 0.0
+
+
+def _rh1_anio(anio):
+    sel = ",".join(["sede", "fecha", "mes"] + RESIDUO_COLS)
+    return _sb("GET", f"rh1_diario?anio=eq.{anio}&select={sel}") or []
+
+
+def _estadisticas(rows):
+    por_sede, tot_pel, tot_no = {}, 0.0, 0.0
+    for r in rows:
+        s = r.get("sede") or "(sin sede)"
+        acc = por_sede.setdefault(s, {"peligrosos": 0.0, "no_peligrosos": 0.0, "registros": 0})
+        acc["registros"] += 1
+        for c in RESIDUO_COLS:
+            v = _num(r.get(c))
+            if c in _PELIGROSOS:
+                acc["peligrosos"] += v; tot_pel += v
+            else:
+                acc["no_peligrosos"] += v; tot_no += v
+    for d in por_sede.values():
+        d["peligrosos"] = round(d["peligrosos"], 2)
+        d["no_peligrosos"] = round(d["no_peligrosos"], 2)
+    return {"por_sede": por_sede, "total_peligrosos": round(tot_pel, 2),
+            "total_no_peligrosos": round(tot_no, 2),
+            "total_general": round(tot_pel + tot_no, 2)}
+
+
+def _tendencias(rows, anio, mes):
+    por_mes = {}
+    for r in rows:
+        m = int(r.get("mes") or 0)
+        por_mes[m] = por_mes.get(m, 0.0) + sum(_num(r.get(c)) for c in RESIDUO_COLS)
+    total_anio = round(sum(por_mes.values()), 2)
+    total_mes = round(por_mes.get(mes, 0.0), 2)
+    mes_ant = round(por_mes.get(mes - 1, 0.0), 2) if mes > 1 else 0.0
+    var = round((total_mes - mes_ant) / mes_ant * 100, 1) if mes_ant else None
+    con_datos = [por_mes[m] for m in range(1, mes + 1) if por_mes.get(m, 0) > 0]
+    proy = round(sum(con_datos) / len(con_datos) * 12, 1) if con_datos else 0.0
+    return {"total_anio": total_anio, "total_mes": total_mes,
+            "mes_anterior": mes_ant, "var_mes_pct": var,
+            "proyeccion_anual": proy, "mes_nombre": MESES_ES[mes]}
+
+
+def _indicadores_eval():
+    inds = _sb("GET", "indicadores?select=id,codigo,nombre,unidad,meta,frecuencia"
+                      "&order=codigo") or []
+    out, incum, sin_eval = [], 0, 0
+    for ind in inds:
+        ev = _sb("GET", f"indicador_eval?indicador_id=eq.{ind['id']}"
+                        f"&select=fecha,periodo,resultado,cumple&order=fecha.desc&limit=1") or []
+        if ev:
+            e = ev[0]
+            cumple = bool(e.get("cumple"))
+            if not cumple:
+                incum += 1
+            out.append({"codigo": ind.get("codigo", ""), "nombre": ind.get("nombre", ""),
+                        "unidad": ind.get("unidad", "%"), "meta": _num(ind.get("meta")),
+                        "resultado": round(_num(e.get("resultado")), 2),
+                        "periodo": e.get("periodo") or e.get("fecha", ""),
+                        "cumple": cumple})
+        else:
+            sin_eval += 1
+            out.append({"codigo": ind.get("codigo", ""), "nombre": ind.get("nombre", ""),
+                        "unidad": ind.get("unidad", "%"), "meta": _num(ind.get("meta")),
+                        "resultado": None, "periodo": "", "cumple": None})
+    return out, incum, sin_eval
+
+
+def _semaforo(rows, anio, mes):
+    out = []
+    hoy = datetime.now().date()
+
+    def add(modulo, estado, detalle):
+        out.append({"modulo": modulo, "estado": estado, "detalle": detalle})
+
+    try:  # RH1: días sin registrar este mes
+        fechas = {r["fecha"] for r in rows if int(r.get("mes") or 0) == mes}
+        falt = sum(1 for d in range(1, hoy.day + 1)
+                   if f"{anio}-{mes:02d}-{d:02d}" not in fechas)
+        if falt == 0:
+            add("RH1", "verde", "Registro diario al día")
+        elif falt <= 3:
+            add("RH1", "amarillo", f"{falt} día(s) sin registrar este mes")
+        else:
+            add("RH1", "rojo", f"{falt} días sin registrar este mes")
+    except Exception:
+        pass
+
+    try:  # Entregas sin certificado del gestor (año)
+        ent = _sb("GET", f"entregas?fecha=like.{anio}-*&select=num_certificado") or []
+        n = sum(1 for e in ent if not (e.get("num_certificado") or "").strip())
+        if n == 0:
+            add("Entregas", "verde", "Todas las entregas con certificado")
+        elif n <= 2:
+            add("Entregas", "amarillo", f"{n} entrega(s) sin certificado")
+        else:
+            add("Entregas", "rojo", f"{n} entregas sin certificado")
+    except Exception:
+        pass
+
+    try:  # Indicadores
+        _, incum, sin_eval = _indicadores_eval()
+        total = incum + sin_eval
+        if incum == 0 and sin_eval == 0:
+            add("Indicadores", "verde", "Todos cumplen su meta")
+        elif incum >= 2 or (total and sin_eval == total):
+            add("Indicadores", "rojo", f"{incum} sin cumplir, {sin_eval} sin evaluar")
+        else:
+            add("Indicadores", "amarillo", f"{incum} sin cumplir, {sin_eval} sin evaluar")
+    except Exception:
+        pass
+
+    try:  # Cronograma vencido
+        acts = _sb("GET", f"cronograma?anio=eq.{anio}&select=estado,plazo_fecha") or []
+        venc = sum(1 for a in acts if a.get("estado") not in ("Completada", "Cancelada")
+                   and a.get("plazo_fecha") and a["plazo_fecha"] < hoy.isoformat())
+        if venc == 0:
+            add("Cronograma", "verde", "Sin actividades vencidas")
+        elif venc <= 2:
+            add("Cronograma", "amarillo", f"{venc} actividad(es) vencida(s)")
+        else:
+            add("Cronograma", "rojo", f"{venc} actividades vencidas")
+    except Exception:
+        pass
+
+    try:  # Contingencias abiertas
+        cont = _sb("GET", "contingencias?select=estado") or []
+        ab = sum(1 for c in cont if c.get("estado") != "Cerrada")
+        if ab == 0:
+            add("Contingencias", "verde", "Sin contingencias abiertas")
+        elif ab <= 1:
+            add("Contingencias", "amarillo", "1 contingencia abierta")
+        else:
+            add("Contingencias", "rojo", f"{ab} contingencias abiertas")
+    except Exception:
+        pass
+
+    try:  # GAGAS última reunión
+        re = _sb("GET", "gagas_reuniones?select=fecha&order=fecha.desc&limit=1") or []
+        ultima = re[0]["fecha"] if re else ""
+        lim_a = (hoy - timedelta(days=60)).isoformat()
+        lim_r = (hoy - timedelta(days=90)).isoformat()
+        if ultima and ultima >= lim_a:
+            add("GAGAS", "verde", f"Última reunión: {ultima}")
+        elif ultima and ultima >= lim_r:
+            add("GAGAS", "amarillo", f"Última reunión: {ultima}")
+        else:
+            add("GAGAS", "rojo", f"Última reunión: {ultima or 'sin registros'}")
+    except Exception:
+        pass
+
+    try:  # Presupuesto
+        pres = _sb("GET", f"presupuesto?anio=eq.{anio}&select=id,monto_asignado") or []
+        gas = _sb("GET", f"gastos?anio=eq.{anio}&select=rubro_id,valor") or []
+        ejec = {}
+        for g in gas:
+            ejec[g.get("rubro_id")] = ejec.get(g.get("rubro_id"), 0) + _num(g.get("valor"))
+        sobre = [p for p in pres if _num(p.get("monto_asignado")) > 0
+                 and ejec.get(p["id"], 0) > _num(p.get("monto_asignado"))]
+        casi = [p for p in pres if _num(p.get("monto_asignado")) > 0
+                and 0.9 <= ejec.get(p["id"], 0) / _num(p.get("monto_asignado")) <= 1]
+        if sobre:
+            add("Presupuesto", "rojo", f"{len(sobre)} rubro(s) sobreejecutado(s)")
+        elif casi:
+            add("Presupuesto", "amarillo", f"{len(casi)} rubro(s) ≥90% ejecutado(s)")
+        elif pres:
+            add("Presupuesto", "verde", "Ejecución bajo control")
+    except Exception:
+        pass
+
+    return out
+
+
+def _entidad_nombre():
+    try:
+        c = _sb("GET", "clientes?select=razon_social&limit=1") or []
+        return c[0].get("razon_social", "") if c else ""
+    except Exception:
+        return ""
+
+
+def _dashboard_data(t):
+    anio = datetime.now().year
+    mes = datetime.now().month
+    rows = _rh1_anio(anio)
+    indicadores, _, _ = _indicadores_eval()
+    return {
+        "anio": anio,
+        "estadisticas": _estadisticas(rows),
+        "tendencias": _tendencias(rows, anio, mes),
+        "semaforo": _semaforo(rows, anio, mes),
+        "indicadores": indicadores,
+        "entidad": _entidad_nombre(),
+        "usuarios": _sb("GET", "usuarios?select=username,nombre_completo,rol,activo,"
+                               "sede_asignada,bloqueado&order=username") or [],
+    }
+
+
+@app.post("/movil/dashboard")
+def movil_dashboard(body: MovilToken, x_app_key: str = Header(None)):
+    _auth(x_app_key)
+    t = _validar_token(body.token)
+    if not t or t["role"] != "admin":
+        raise HTTPException(403, "Solo administradores.")
+    return {"ok": True, **_dashboard_data(t)}
+
+
+# ── Generación de informes (PDF / Excel) ─────────────────────────────────────
+def _informe_pdf(data, entidad):
+    from io import BytesIO
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import cm
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table,
+                                    TableStyle)
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=1.6 * cm,
+                            bottomMargin=1.6 * cm, leftMargin=1.6 * cm, rightMargin=1.6 * cm)
+    st = getSampleStyleSheet()
+    h1 = ParagraphStyle("h1", parent=st["Title"], textColor=colors.HexColor("#1B4E73"), fontSize=20)
+    h2 = ParagraphStyle("h2", parent=st["Heading2"], textColor=colors.HexColor("#2E7FB8"))
+    small = ParagraphStyle("small", parent=st["Normal"], fontSize=9, textColor=colors.HexColor("#666666"))
+    AZUL = colors.HexColor("#2E7FB8")
+    el = []
+
+    el.append(Paragraph("Informe General PGIRASA", h1))
+    if entidad or data.get("entidad"):
+        el.append(Paragraph(entidad or data.get("entidad", ""), st["Heading3"]))
+    el.append(Paragraph(f"Generado: {datetime.now().strftime('%Y-%m-%d %H:%M')} · "
+                        f"Año {data['anio']}", small))
+    el.append(Spacer(1, 0.4 * cm))
+
+    est = data["estadisticas"]
+    ten = data["tendencias"]
+    el.append(Paragraph("Resumen de residuos", h2))
+    resumen = [["Indicador", "Valor (kg)"],
+               ["Peligrosos", f"{est['total_peligrosos']:,.1f}"],
+               ["No peligrosos", f"{est['total_no_peligrosos']:,.1f}"],
+               ["Total año", f"{est['total_general']:,.1f}"],
+               [f"Total {ten['mes_nombre']}", f"{ten['total_mes']:,.1f}"],
+               ["Proyección anual", f"{ten['proyeccion_anual']:,.1f}"]]
+    t1 = Table(resumen, colWidths=[8 * cm, 6 * cm])
+    t1.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), AZUL),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#CAD6E5")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F2F4F7")]),
+        ("FONTSIZE", (0, 0), (-1, -1), 9)]))
+    el.append(t1)
+    el.append(Spacer(1, 0.4 * cm))
+
+    el.append(Paragraph("Generación por sede", h2))
+    filas = [["Sede", "Peligrosos", "No pelig.", "Registros"]]
+    for s, d in est["por_sede"].items():
+        filas.append([s, f"{d['peligrosos']:,.1f}", f"{d['no_peligrosos']:,.1f}", str(d["registros"])])
+    if len(filas) == 1:
+        filas.append(["(sin datos)", "0", "0", "0"])
+    t2 = Table(filas, colWidths=[6 * cm, 3 * cm, 3 * cm, 2.5 * cm])
+    t2.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), AZUL),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#CAD6E5")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F2F4F7")]),
+        ("FONTSIZE", (0, 0), (-1, -1), 9)]))
+    el.append(t2)
+    el.append(Spacer(1, 0.4 * cm))
+
+    el.append(Paragraph("Semáforo de cumplimiento", h2))
+    _col = {"verde": colors.HexColor("#2E7D32"), "amarillo": colors.HexColor("#B77900"),
+            "rojo": colors.HexColor("#C62828")}
+    sfilas = [["Módulo", "Estado", "Detalle"]]
+    for s in data["semaforo"]:
+        sfilas.append([s["modulo"], s["estado"].upper(), s["detalle"]])
+    if len(sfilas) == 1:
+        sfilas.append(["(sin datos)", "-", ""])
+    t3 = Table(sfilas, colWidths=[4 * cm, 2.5 * cm, 8 * cm])
+    estilo3 = [("BACKGROUND", (0, 0), (-1, 0), AZUL),
+               ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+               ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#CAD6E5")),
+               ("FONTSIZE", (0, 0), (-1, -1), 9)]
+    for i, s in enumerate(data["semaforo"], start=1):
+        estilo3.append(("TEXTCOLOR", (1, i), (1, i), _col.get(s["estado"], colors.black)))
+    t3.setStyle(TableStyle(estilo3))
+    el.append(t3)
+    el.append(Spacer(1, 0.4 * cm))
+
+    el.append(Paragraph("Evaluación de indicadores (Res. 591/2024)", h2))
+    ifilas = [["Código", "Indicador", "Meta", "Resultado", "Cumple"]]
+    for ind in data["indicadores"]:
+        res = "—" if ind["resultado"] is None else f"{ind['resultado']:,.1f}{ind['unidad']}"
+        cum = "Sin evaluar" if ind["cumple"] is None else ("Sí" if ind["cumple"] else "No")
+        ifilas.append([ind["codigo"], ind["nombre"][:40],
+                       f"{ind['meta']:,.0f}{ind['unidad']}", res, cum])
+    if len(ifilas) == 1:
+        ifilas.append(["—", "(sin indicadores)", "—", "—", "—"])
+    t4 = Table(ifilas, colWidths=[2 * cm, 6.5 * cm, 2.2 * cm, 2.5 * cm, 2 * cm])
+    t4.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), AZUL),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#CAD6E5")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F2F4F7")]),
+        ("FONTSIZE", (0, 0), (-1, -1), 8)]))
+    el.append(t4)
+
+    doc.build(el)
+    return buf.getvalue(), "application/pdf", f"informe_pgirasa_{data['anio']}.pdf"
+
+
+def _informe_xlsx(data, entidad):
+    from io import BytesIO
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    wb = Workbook()
+    azul = PatternFill("solid", fgColor="2E7FB8")
+    blanco = Font(color="FFFFFF", bold=True)
+    cen = Alignment(horizontal="center")
+
+    def encabezado(ws, cols):
+        ws.append(cols)
+        for c in ws[1]:
+            c.fill = azul; c.font = blanco; c.alignment = cen
+
+    est = data["estadisticas"]; ten = data["tendencias"]
+    ws = wb.active; ws.title = "Resumen"
+    encabezado(ws, ["Indicador", "Valor (kg)"])
+    for k, v in [("Peligrosos", est["total_peligrosos"]),
+                 ("No peligrosos", est["total_no_peligrosos"]),
+                 ("Total año", est["total_general"]),
+                 (f"Total {ten['mes_nombre']}", ten["total_mes"]),
+                 ("Mes anterior", ten["mes_anterior"]),
+                 ("Proyección anual", ten["proyeccion_anual"])]:
+        ws.append([k, v])
+    ws.column_dimensions["A"].width = 26; ws.column_dimensions["B"].width = 16
+
+    ws2 = wb.create_sheet("Por sede")
+    encabezado(ws2, ["Sede", "Peligrosos", "No peligrosos", "Registros"])
+    for s, d in est["por_sede"].items():
+        ws2.append([s, d["peligrosos"], d["no_peligrosos"], d["registros"]])
+    for col, an in zip("ABCD", (26, 14, 14, 12)):
+        ws2.column_dimensions[col].width = an
+
+    ws3 = wb.create_sheet("Semáforo")
+    encabezado(ws3, ["Módulo", "Estado", "Detalle"])
+    for s in data["semaforo"]:
+        ws3.append([s["modulo"], s["estado"].upper(), s["detalle"]])
+    for col, an in zip("ABC", (20, 14, 50)):
+        ws3.column_dimensions[col].width = an
+
+    ws4 = wb.create_sheet("Indicadores")
+    encabezado(ws4, ["Código", "Indicador", "Meta", "Unidad", "Resultado", "Periodo", "Cumple"])
+    for ind in data["indicadores"]:
+        ws4.append([ind["codigo"], ind["nombre"], ind["meta"], ind["unidad"],
+                    ind["resultado"], ind["periodo"],
+                    "Sin evaluar" if ind["cumple"] is None else ("Sí" if ind["cumple"] else "No")])
+    for col, an in zip("ABCDEFG", (12, 40, 10, 8, 12, 14, 12)):
+        ws4.column_dimensions[col].width = an
+
+    buf = BytesIO(); wb.save(buf)
+    return (buf.getvalue(),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            f"informe_pgirasa_{data['anio']}.xlsx")
+
+
+@app.get("/movil/informe")
+def movil_informe(token: str, formato: str = "pdf", entidad: str = ""):
+    """Descarga directa del informe (autenticado por el token firmado de la app).
+
+    Se accede por GET para poder abrirlo desde el navegador del celular.
+    """
+    t = _validar_token(token)
+    if not t or t["role"] != "admin":
+        raise HTTPException(403, "Solo administradores.")
+    data = _dashboard_data(t)
+    try:
+        if (formato or "pdf").lower() == "xlsx":
+            contenido, mime, fn = _informe_xlsx(data, entidad)
+        else:
+            contenido, mime, fn = _informe_pdf(data, entidad)
+    except ImportError as e:
+        raise HTTPException(500, f"Falta una dependencia en el backend: {e}. "
+                                 "Agrega 'reportlab' y 'openpyxl' a requirements.txt.")
+    return Response(content=contenido, media_type=mime,
+                    headers={"Content-Disposition": f'attachment; filename="{fn}"'})
