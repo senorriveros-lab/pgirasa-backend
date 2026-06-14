@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import os
 import smtplib
+import threading
 import time
 import urllib.parse
 from datetime import datetime, timedelta, date
@@ -25,6 +26,9 @@ from pydantic import BaseModel
 
 # ── Configuración (variables de entorno en Coolify) ──────────────────────────
 APP_API_KEY        = os.getenv("APP_API_KEY", "")
+# Clave EXCLUSIVA de la app móvil: solo habilita las rutas /movil/*.
+# Si se filtra (al descompilar el APK), NO da acceso a licencias/pagos/sync.
+MOVIL_API_KEY      = os.getenv("MOVIL_API_KEY", "")
 SUPABASE_URL       = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 WOMPI_PUBLIC_KEY   = os.getenv("WOMPI_PUBLIC_KEY", "")
@@ -42,8 +46,46 @@ app = FastAPI(title="PGIRASA Backend", version="1.0.0")
 
 # ── Seguridad: clave compartida ──────────────────────────────────────────────
 def _auth(x_app_key: str | None):
+    """Clave principal: rutas sensibles (licencias, pagos, correo, sync)."""
     if not APP_API_KEY or x_app_key != APP_API_KEY:
         raise HTTPException(status_code=401, detail="No autorizado.")
+
+
+def _auth_movil(x_app_key: str | None):
+    """Rutas /movil/*: acepta la clave de móvil (limitada) o la principal.
+
+    Así la app móvil puede usar una clave que NO abre los endpoints sensibles.
+    Es retrocompatible: mientras no se configure MOVIL_API_KEY, sigue valiendo
+    la clave principal que la app ya enviaba.
+    """
+    validas = {k for k in (APP_API_KEY, MOVIL_API_KEY) if k}
+    if not validas or x_app_key not in validas:
+        raise HTTPException(status_code=401, detail="No autorizado.")
+
+
+# ── Freno a fuerza bruta en el login (en memoria) ────────────────────────────
+_LOGIN_LOCK = threading.Lock()
+_LOGIN_INTENTOS = {}      # usuario -> [timestamps de fallos recientes]
+_LOGIN_MAX = 5            # fallos permitidos
+_LOGIN_VENTANA = 300      # segundos (5 minutos)
+
+
+def _login_bloqueado(usuario):
+    ahora = time.time()
+    with _LOGIN_LOCK:
+        intentos = [x for x in _LOGIN_INTENTOS.get(usuario, []) if ahora - x < _LOGIN_VENTANA]
+        _LOGIN_INTENTOS[usuario] = intentos
+        return len(intentos) >= _LOGIN_MAX
+
+
+def _login_fallo(usuario):
+    with _LOGIN_LOCK:
+        _LOGIN_INTENTOS.setdefault(usuario, []).append(time.time())
+
+
+def _login_ok(usuario):
+    with _LOGIN_LOCK:
+        _LOGIN_INTENTOS.pop(usuario, None)
 
 
 # ── Cliente Supabase (service_role) ──────────────────────────────────────────
@@ -400,8 +442,12 @@ class MovilBloquear(BaseModel):
 
 @app.post("/movil/login")
 def movil_login(body: MovilLogin, x_app_key: str = Header(None)):
-    _auth(x_app_key)
+    _auth_movil(x_app_key)
     from concurrent.futures import ThreadPoolExecutor
+    usuario = body.usuario.strip()
+    if _login_bloqueado(usuario):
+        return {"ok": False, "mensaje": "Demasiados intentos fallidos. "
+                "Espera unos minutos e inténtalo de nuevo."}
     nit = body.nit.strip()
     # Las 3 consultas (cliente por NIT, usuario y sedes) son independientes:
     # se lanzan en paralelo. Devolver las sedes en el login evita una consulta
@@ -423,6 +469,7 @@ def movil_login(body: MovilLogin, x_app_key: str = Header(None)):
     if not cli:
         return {"ok": False, "mensaje": "NIT no encontrado."}
     if not res:
+        _login_fallo(usuario)
         return {"ok": False, "mensaje": "Usuario o contraseña incorrectos."}
     u = res[0]
     if not u.get("activo", 1):
@@ -430,7 +477,9 @@ def movil_login(body: MovilLogin, x_app_key: str = Header(None)):
     if u.get("bloqueado"):
         return {"ok": False, "mensaje": "Cuenta bloqueada. Contacta al administrador."}
     if not _verificar_pwd(body.password, u.get("password_hash", "")):
+        _login_fallo(usuario)
         return {"ok": False, "mensaje": "Usuario o contraseña incorrectos."}
+    _login_ok(usuario)
     sede = u.get("sede_asignada") or ""
     token = _crear_token(u["username"], u.get("rol", "usuario"), sede)
     sedes = [s["nombre"] for s in sedes_all if s.get("nombre")]
@@ -443,7 +492,7 @@ def movil_login(body: MovilLogin, x_app_key: str = Header(None)):
 
 @app.post("/movil/sedes")
 def movil_sedes(body: MovilToken, x_app_key: str = Header(None)):
-    _auth(x_app_key)
+    _auth_movil(x_app_key)
     t = _validar_token(body.token)
     if not t:
         raise HTTPException(401, "Sesión expirada. Inicia sesión de nuevo.")
@@ -456,7 +505,7 @@ def movil_sedes(body: MovilToken, x_app_key: str = Header(None)):
 
 @app.post("/movil/registrar")
 def movil_registrar(body: MovilRegistrar, x_app_key: str = Header(None)):
-    _auth(x_app_key)
+    _auth_movil(x_app_key)
     t = _validar_token(body.token)
     if not t:
         raise HTTPException(401, "Sesión expirada. Inicia sesión de nuevo.")
@@ -486,7 +535,7 @@ def movil_registrar(body: MovilRegistrar, x_app_key: str = Header(None)):
 
 @app.post("/movil/estadisticas")
 def movil_estadisticas(body: MovilToken, x_app_key: str = Header(None)):
-    _auth(x_app_key)
+    _auth_movil(x_app_key)
     t = _validar_token(body.token)
     if not t or t["role"] != "admin":
         raise HTTPException(403, "Solo administradores.")
@@ -514,7 +563,7 @@ def movil_estadisticas(body: MovilToken, x_app_key: str = Header(None)):
 
 @app.post("/movil/usuarios")
 def movil_usuarios(body: MovilToken, x_app_key: str = Header(None)):
-    _auth(x_app_key)
+    _auth_movil(x_app_key)
     t = _validar_token(body.token)
     if not t or t["role"] != "admin":
         raise HTTPException(403, "Solo administradores.")
@@ -525,7 +574,7 @@ def movil_usuarios(body: MovilToken, x_app_key: str = Header(None)):
 
 @app.post("/movil/bloquear")
 def movil_bloquear(body: MovilBloquear, x_app_key: str = Header(None)):
-    _auth(x_app_key)
+    _auth_movil(x_app_key)
     t = _validar_token(body.token)
     if not t or t["role"] != "admin":
         raise HTTPException(403, "Solo administradores.")
@@ -779,7 +828,7 @@ def _dashboard_data(t):
 
 @app.post("/movil/dashboard")
 def movil_dashboard(body: MovilToken, x_app_key: str = Header(None)):
-    _auth(x_app_key)
+    _auth_movil(x_app_key)
     t = _validar_token(body.token)
     if not t or t["role"] != "admin":
         raise HTTPException(403, "Solo administradores.")
