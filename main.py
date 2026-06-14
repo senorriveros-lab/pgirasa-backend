@@ -56,9 +56,14 @@ def _sb_headers(extra=None):
     return h
 
 
+# Sesión HTTP persistente: reutiliza conexiones (keep-alive) hacia Supabase,
+# evitando el handshake TCP en cada llamada. Acelera login y dashboard.
+_SB_SESSION = requests.Session()
+
+
 def _sb(method, path, data=None, headers=None):
     url = f"{SUPABASE_URL}/rest/v1/{path}"
-    r = requests.request(method, url, json=data, headers=headers or _sb_headers(), timeout=25)
+    r = _SB_SESSION.request(method, url, json=data, headers=headers or _sb_headers(), timeout=25)
     r.raise_for_status()
     return r.json() if r.text else None
 
@@ -398,16 +403,23 @@ def movil_login(body: MovilLogin, x_app_key: str = Header(None)):
     _auth(x_app_key)
     from concurrent.futures import ThreadPoolExecutor
     nit = body.nit.strip()
-    # Las dos consultas (cliente por NIT y usuario) son independientes: en paralelo.
-    with ThreadPoolExecutor(max_workers=2) as ex:
+    # Las 3 consultas (cliente por NIT, usuario y sedes) son independientes:
+    # se lanzan en paralelo. Devolver las sedes en el login evita una consulta
+    # extra después (acelera la pantalla de registro del usuario).
+    with ThreadPoolExecutor(max_workers=3) as ex:
         f_cli = ex.submit(_sb, "GET",
                           f"clientes?nit=eq.{urllib.parse.quote(nit)}&select=razon_social&limit=1")
         f_usr = ex.submit(_sb, "GET",
                           f"usuarios?username=eq.{urllib.parse.quote(body.usuario.strip())}"
                           f"&select=username,password_hash,nombre_completo,rol,activo,"
                           f"sede_asignada,bloqueado")
+        f_sed = ex.submit(_sb, "GET", "sedes?activo=eq.1&select=nombre&order=nombre")
         cli = f_cli.result()
         res = f_usr.result()
+        try:
+            sedes_all = f_sed.result() or []
+        except Exception:
+            sedes_all = []
     if not cli:
         return {"ok": False, "mensaje": "NIT no encontrado."}
     if not res:
@@ -421,9 +433,12 @@ def movil_login(body: MovilLogin, x_app_key: str = Header(None)):
         return {"ok": False, "mensaje": "Usuario o contraseña incorrectos."}
     sede = u.get("sede_asignada") or ""
     token = _crear_token(u["username"], u.get("rol", "usuario"), sede)
+    sedes = [s["nombre"] for s in sedes_all if s.get("nombre")]
+    if sede:  # usuario con sede asignada: solo la suya
+        sedes = [x for x in sedes if x == sede]
     return {"ok": True, "token": token, "rol": u.get("rol", "usuario"),
             "nombre": u.get("nombre_completo", ""), "sede_asignada": sede,
-            "entidad": cli[0].get("razon_social", "")}
+            "entidad": cli[0].get("razon_social", ""), "sedes": sedes}
 
 
 @app.post("/movil/sedes")
