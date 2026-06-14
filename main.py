@@ -396,13 +396,20 @@ class MovilBloquear(BaseModel):
 @app.post("/movil/login")
 def movil_login(body: MovilLogin, x_app_key: str = Header(None)):
     _auth(x_app_key)
+    from concurrent.futures import ThreadPoolExecutor
     nit = body.nit.strip()
-    # Verificar que el NIT corresponde a un cliente registrado
-    cli = _sb("GET", f"clientes?nit=eq.{urllib.parse.quote(nit)}&select=razon_social&limit=1")
+    # Las dos consultas (cliente por NIT y usuario) son independientes: en paralelo.
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_cli = ex.submit(_sb, "GET",
+                          f"clientes?nit=eq.{urllib.parse.quote(nit)}&select=razon_social&limit=1")
+        f_usr = ex.submit(_sb, "GET",
+                          f"usuarios?username=eq.{urllib.parse.quote(body.usuario.strip())}"
+                          f"&select=username,password_hash,nombre_completo,rol,activo,"
+                          f"sede_asignada,bloqueado")
+        cli = f_cli.result()
+        res = f_usr.result()
     if not cli:
         return {"ok": False, "mensaje": "NIT no encontrado."}
-    res = _sb("GET", f"usuarios?username=eq.{urllib.parse.quote(body.usuario.strip())}"
-                     f"&select=username,password_hash,nombre_completo,rol,activo,sede_asignada,bloqueado")
     if not res:
         return {"ok": False, "mensaje": "Usuario o contraseña incorrectos."}
     u = res[0]
@@ -447,6 +454,11 @@ def movil_registrar(body: MovilRegistrar, x_app_key: str = Header(None)):
     fila = {"fecha": body.fecha, "anio": dt.year, "mes": dt.month, "dia": dt.day,
             "sede": body.sede, "responsable": t["username"],
             "observaciones": body.observaciones}
+    # La tabla rh1_diario tiene 'id' como PK SIN default; hay que enviarlo.
+    # ID determinístico y grande desde (fecha, sede): mantiene el mismo id al
+    # regrabar el mismo día/sede y no choca con los ids pequeños del escritorio.
+    fila["id"] = 1_000_000_000 + int.from_bytes(
+        hashlib.sha1(f"{body.fecha}|{body.sede}".encode()).digest()[:6], "big")
     for c in RESIDUO_COLS:
         fila[c] = float(body.valores.get(c, 0) or 0)
     try:
@@ -566,32 +578,37 @@ def _tendencias(rows, anio, mes):
             "proyeccion_anual": proy, "mes_nombre": MESES_ES[mes]}
 
 
-def _indicadores_eval():
-    inds = _sb("GET", "indicadores?select=id,codigo,nombre,unidad,meta,frecuencia"
-                      "&order=codigo") or []
+def _indicadores_from(inds, evals):
+    """Evalúa indicadores a partir de datos ya consultados (sin N+1).
+
+    `evals` es la lista completa de indicador_eval ordenada por fecha desc; se
+    toma la primera ocurrencia de cada indicador (la más reciente).
+    """
+    ultimo = {}
+    for e in evals or []:
+        iid = e.get("indicador_id")
+        if iid not in ultimo:
+            ultimo[iid] = e
     out, incum, sin_eval = [], 0, 0
-    for ind in inds:
-        ev = _sb("GET", f"indicador_eval?indicador_id=eq.{ind['id']}"
-                        f"&select=fecha,periodo,resultado,cumple&order=fecha.desc&limit=1") or []
-        if ev:
-            e = ev[0]
+    for ind in inds or []:
+        base = {"codigo": ind.get("codigo", ""), "nombre": ind.get("nombre", ""),
+                "unidad": ind.get("unidad", "%"), "meta": _num(ind.get("meta"))}
+        e = ultimo.get(ind.get("id"))
+        if e:
             cumple = bool(e.get("cumple"))
             if not cumple:
                 incum += 1
-            out.append({"codigo": ind.get("codigo", ""), "nombre": ind.get("nombre", ""),
-                        "unidad": ind.get("unidad", "%"), "meta": _num(ind.get("meta")),
-                        "resultado": round(_num(e.get("resultado")), 2),
-                        "periodo": e.get("periodo") or e.get("fecha", ""),
-                        "cumple": cumple})
+            out.append({**base, "resultado": round(_num(e.get("resultado")), 2),
+                        "periodo": e.get("periodo") or e.get("fecha", ""), "cumple": cumple})
         else:
             sin_eval += 1
-            out.append({"codigo": ind.get("codigo", ""), "nombre": ind.get("nombre", ""),
-                        "unidad": ind.get("unidad", "%"), "meta": _num(ind.get("meta")),
-                        "resultado": None, "periodo": "", "cumple": None})
+            out.append({**base, "resultado": None, "periodo": "", "cumple": None})
     return out, incum, sin_eval
 
 
-def _semaforo(rows, anio, mes):
+def _semaforo_from(rows, anio, mes, ind_stats, entregas, cronograma,
+                   contingencias, gagas, presupuesto, gastos):
+    """Semáforo de cumplimiento a partir de datos ya consultados (sin red)."""
     out = []
     hoy = datetime.now().date()
 
@@ -612,8 +629,7 @@ def _semaforo(rows, anio, mes):
         pass
 
     try:  # Entregas sin certificado del gestor (año)
-        ent = _sb("GET", f"entregas?fecha=like.{anio}-*&select=num_certificado") or []
-        n = sum(1 for e in ent if not (e.get("num_certificado") or "").strip())
+        n = sum(1 for e in (entregas or []) if not (e.get("num_certificado") or "").strip())
         if n == 0:
             add("Entregas", "verde", "Todas las entregas con certificado")
         elif n <= 2:
@@ -623,8 +639,8 @@ def _semaforo(rows, anio, mes):
     except Exception:
         pass
 
-    try:  # Indicadores
-        _, incum, sin_eval = _indicadores_eval()
+    try:  # Indicadores (ya calculado)
+        incum, sin_eval = ind_stats
         total = incum + sin_eval
         if incum == 0 and sin_eval == 0:
             add("Indicadores", "verde", "Todos cumplen su meta")
@@ -636,8 +652,8 @@ def _semaforo(rows, anio, mes):
         pass
 
     try:  # Cronograma vencido
-        acts = _sb("GET", f"cronograma?anio=eq.{anio}&select=estado,plazo_fecha") or []
-        venc = sum(1 for a in acts if a.get("estado") not in ("Completada", "Cancelada")
+        venc = sum(1 for a in (cronograma or [])
+                   if a.get("estado") not in ("Completada", "Cancelada")
                    and a.get("plazo_fecha") and a["plazo_fecha"] < hoy.isoformat())
         if venc == 0:
             add("Cronograma", "verde", "Sin actividades vencidas")
@@ -649,8 +665,7 @@ def _semaforo(rows, anio, mes):
         pass
 
     try:  # Contingencias abiertas
-        cont = _sb("GET", "contingencias?select=estado") or []
-        ab = sum(1 for c in cont if c.get("estado") != "Cerrada")
+        ab = sum(1 for c in (contingencias or []) if c.get("estado") != "Cerrada")
         if ab == 0:
             add("Contingencias", "verde", "Sin contingencias abiertas")
         elif ab <= 1:
@@ -661,8 +676,8 @@ def _semaforo(rows, anio, mes):
         pass
 
     try:  # GAGAS última reunión
-        re = _sb("GET", "gagas_reuniones?select=fecha&order=fecha.desc&limit=1") or []
-        ultima = re[0]["fecha"] if re else ""
+        fechas_g = [r.get("fecha", "") for r in (gagas or []) if r.get("fecha")]
+        ultima = max(fechas_g) if fechas_g else ""
         lim_a = (hoy - timedelta(days=60)).isoformat()
         lim_r = (hoy - timedelta(days=90)).isoformat()
         if ultima and ultima >= lim_a:
@@ -675,20 +690,18 @@ def _semaforo(rows, anio, mes):
         pass
 
     try:  # Presupuesto
-        pres = _sb("GET", f"presupuesto?anio=eq.{anio}&select=id,monto_asignado") or []
-        gas = _sb("GET", f"gastos?anio=eq.{anio}&select=rubro_id,valor") or []
         ejec = {}
-        for g in gas:
+        for g in (gastos or []):
             ejec[g.get("rubro_id")] = ejec.get(g.get("rubro_id"), 0) + _num(g.get("valor"))
-        sobre = [p for p in pres if _num(p.get("monto_asignado")) > 0
+        sobre = [p for p in (presupuesto or []) if _num(p.get("monto_asignado")) > 0
                  and ejec.get(p["id"], 0) > _num(p.get("monto_asignado"))]
-        casi = [p for p in pres if _num(p.get("monto_asignado")) > 0
+        casi = [p for p in (presupuesto or []) if _num(p.get("monto_asignado")) > 0
                 and 0.9 <= ejec.get(p["id"], 0) / _num(p.get("monto_asignado")) <= 1]
         if sobre:
             add("Presupuesto", "rojo", f"{len(sobre)} rubro(s) sobreejecutado(s)")
         elif casi:
             add("Presupuesto", "amarillo", f"{len(casi)} rubro(s) ≥90% ejecutado(s)")
-        elif pres:
+        elif presupuesto:
             add("Presupuesto", "verde", "Ejecución bajo control")
     except Exception:
         pass
@@ -696,28 +709,56 @@ def _semaforo(rows, anio, mes):
     return out
 
 
-def _entidad_nombre():
-    try:
-        c = _sb("GET", "clientes?select=razon_social&limit=1") or []
-        return c[0].get("razon_social", "") if c else ""
-    except Exception:
-        return ""
-
-
 def _dashboard_data(t):
+    """Reúne todos los datos del panel haciendo las consultas en PARALELO.
+
+    Antes se hacían ~20 consultas secuenciales (incluida una por indicador);
+    ahora son ~11 en paralelo y los indicadores en una sola consulta.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
     anio = datetime.now().year
     mes = datetime.now().month
-    rows = _rh1_anio(anio)
-    indicadores, _, _ = _indicadores_eval()
+    sel_rh1 = ",".join(["sede", "fecha", "mes"] + RESIDUO_COLS)
+
+    pedidos = {
+        "rows": f"rh1_diario?anio=eq.{anio}&select={sel_rh1}",
+        "inds": "indicadores?select=id,codigo,nombre,unidad,meta,frecuencia&order=codigo",
+        "evals": "indicador_eval?select=indicador_id,fecha,periodo,resultado,cumple&order=fecha.desc",
+        "entregas": f"entregas?fecha=like.{anio}-*&select=num_certificado",
+        "cronograma": f"cronograma?anio=eq.{anio}&select=estado,plazo_fecha",
+        "contingencias": "contingencias?select=estado",
+        "gagas": "gagas_reuniones?select=fecha&order=fecha.desc&limit=1",
+        "presupuesto": f"presupuesto?anio=eq.{anio}&select=id,monto_asignado",
+        "gastos": f"gastos?anio=eq.{anio}&select=rubro_id,valor",
+        "usuarios": ("usuarios?select=username,nombre_completo,rol,activo,"
+                     "sede_asignada,bloqueado&order=username"),
+        "clientes": "clientes?select=razon_social&limit=1",
+    }
+
+    def g(path):
+        try:
+            return _sb("GET", path) or []
+        except Exception:
+            return []
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        fut = {k: ex.submit(g, p) for k, p in pedidos.items()}
+        D = {k: f.result() for k, f in fut.items()}
+
+    rows = D["rows"]
+    indicadores, incum, sin_eval = _indicadores_from(D["inds"], D["evals"])
+    entidad = D["clientes"][0].get("razon_social", "") if D["clientes"] else ""
     return {
         "anio": anio,
         "estadisticas": _estadisticas(rows),
         "tendencias": _tendencias(rows, anio, mes),
-        "semaforo": _semaforo(rows, anio, mes),
+        "semaforo": _semaforo_from(rows, anio, mes, (incum, sin_eval),
+                                   D["entregas"], D["cronograma"], D["contingencias"],
+                                   D["gagas"], D["presupuesto"], D["gastos"]),
         "indicadores": indicadores,
-        "entidad": _entidad_nombre(),
-        "usuarios": _sb("GET", "usuarios?select=username,nombre_completo,rol,activo,"
-                               "sede_asignada,bloqueado&order=username") or [],
+        "entidad": entidad,
+        "usuarios": D["usuarios"],
     }
 
 
