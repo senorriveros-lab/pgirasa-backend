@@ -308,6 +308,16 @@ def estado(body: Estado, x_app_key: str = Header(None)):
             "motivo": "" if activa else "La licencia venció. Renueva el pago para continuar."}
 
 
+def _actualizar_pcs(serial, total):
+    """Refleja en licencias.pcs_registrados la cantidad de equipos registrados."""
+    try:
+        _sb("PATCH", f"licencias?serial_compra=eq.{urllib.parse.quote(serial)}",
+            data={"pcs_registrados": int(total)},
+            headers=_sb_headers({"Prefer": "return=minimal"}))
+    except Exception:
+        pass
+
+
 @app.post("/licencia/activar")
 def activar(body: Activar, x_app_key: str = Header(None)):
     _auth(x_app_key)
@@ -331,6 +341,7 @@ def activar(body: Activar, x_app_key: str = Header(None)):
     _sb("POST", "clientes?on_conflict=serial_ref", data=cliente,
         headers=_sb_headers({"Prefer": "resolution=merge-duplicates,return=minimal"}))
     if body.device_id in ids:
+        _actualizar_pcs(body.serial, len(ids))
         return {"ok": True, "mensaje": "Este equipo ya estaba registrado. Licencia activada."}
     if len(ids) >= limite:
         return {"ok": False, "mensaje": f"Esta licencia ya está en uso en {limite} equipos."}
@@ -338,6 +349,7 @@ def activar(body: Activar, x_app_key: str = Header(None)):
                                  "nombre_equipo": body.nombre_equipo,
                                  "registrado_en": datetime.now().isoformat()},
         headers=_sb_headers({"Prefer": "return=minimal"}))
+    _actualizar_pcs(body.serial, len(ids) + 1)
     return {"ok": True, "mensaje": f"¡Licencia activada! Equipos en uso: {len(ids)+1} de {limite}."}
 
 
@@ -455,16 +467,21 @@ def datos_restaurar(body: Restaurar, x_app_key: str = Header(None)):
                       "nombre_equipo": body.nombre_equipo,
                       "registrado_en": datetime.now().isoformat()},
                 headers=_sb_headers({"Prefer": "return=minimal"}))
+            _actualizar_pcs(serial, len(ids) + 1)
+        else:
+            _actualizar_pcs(serial, len(ids))
 
-    # Descargar todas las tablas del negocio.
+    # Descargar SOLO las tablas de esta empresa (filtradas por su NIT).
+    nit_emp = (cli[0].get("nit") or "").strip()
+    nit_q = urllib.parse.quote(nit_emp)
     tablas = {}
     for t in TABLAS_RESTAURABLES:
         try:
-            tablas[t] = _sb("GET", f"{t}?select=*") or []
+            tablas[t] = _sb("GET", f"{t}?nit=eq.{nit_q}&select=*") or []
         except Exception:
             tablas[t] = []
     return {"ok": True, "entidad": cli[0].get("razon_social", ""),
-            "nit": cli[0].get("nit", ""), "tablas": tablas}
+            "nit": nit_emp, "tablas": tablas}
 
 
 # ============================================================
@@ -484,9 +501,9 @@ RESIDUOS = [
 RESIDUO_COLS = [c[0] for c in RESIDUOS]
 
 
-def _crear_token(username, role, sede):
+def _crear_token(username, role, sede, nit):
     exp = int(time.time()) + TOKEN_TTL_DIAS * 86400
-    payload = f"{username}|{role}|{sede}|{exp}"
+    payload = f"{username}|{role}|{sede}|{nit}|{exp}"
     sig = hmac.new(APP_API_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
     return base64.urlsafe_b64encode(payload.encode()).decode() + "." + sig
 
@@ -498,10 +515,16 @@ def _validar_token(token):
         esperado = hmac.new(APP_API_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(sig, esperado):
             return None
-        username, role, sede, exp = payload.split("|")
+        partes = payload.split("|")
+        if len(partes) == 5:        # nuevo formato: incluye nit
+            username, role, sede, nit, exp = partes
+        elif len(partes) == 4:      # formato anterior (sin nit): forzar re-login
+            return None
+        else:
+            return None
         if int(exp) < int(time.time()):
             return None
-        return {"username": username, "role": role, "sede": sede}
+        return {"username": username, "role": role, "sede": sede, "nit": nit}
     except Exception:
         return None
 
@@ -554,10 +577,13 @@ def movil_login(body: MovilLogin, x_app_key: str = Header(None)):
         f_cli = ex.submit(_sb, "GET",
                           f"clientes?nit=eq.{urllib.parse.quote(nit)}&select=razon_social&limit=1")
         f_usr = ex.submit(_sb, "GET",
-                          f"usuarios?username=eq.{urllib.parse.quote(body.usuario.strip())}"
+                          f"usuarios?nit=eq.{urllib.parse.quote(nit)}"
+                          f"&username=eq.{urllib.parse.quote(usuario)}"
                           f"&select=username,password_hash,nombre_completo,rol,activo,"
                           f"sede_asignada,bloqueado")
-        f_sed = ex.submit(_sb, "GET", "sedes?activo=eq.1&select=nombre&order=nombre")
+        f_sed = ex.submit(_sb, "GET",
+                          f"sedes?nit=eq.{urllib.parse.quote(nit)}"
+                          f"&activo=eq.1&select=nombre&order=nombre")
         cli = f_cli.result()
         res = f_usr.result()
         try:
@@ -579,7 +605,7 @@ def movil_login(body: MovilLogin, x_app_key: str = Header(None)):
         return {"ok": False, "mensaje": "Usuario o contraseña incorrectos."}
     _login_ok(usuario)
     sede = u.get("sede_asignada") or ""
-    token = _crear_token(u["username"], u.get("rol", "usuario"), sede)
+    token = _crear_token(u["username"], u.get("rol", "usuario"), sede, nit)
     sedes = [s["nombre"] for s in sedes_all if s.get("nombre")]
     if sede:  # usuario con sede asignada: solo la suya
         sedes = [x for x in sedes if x == sede]
@@ -594,7 +620,8 @@ def movil_sedes(body: MovilToken, x_app_key: str = Header(None)):
     t = _validar_token(body.token)
     if not t:
         raise HTTPException(401, "Sesión expirada. Inicia sesión de nuevo.")
-    res = _sb("GET", "sedes?activo=eq.1&select=nombre&order=nombre") or []
+    nit = urllib.parse.quote(t["nit"])
+    res = _sb("GET", f"sedes?nit=eq.{nit}&activo=eq.1&select=nombre&order=nombre") or []
     todas = [r["nombre"] for r in res]
     if t["sede"]:
         todas = [s for s in todas if s == t["sede"]]
@@ -613,18 +640,17 @@ def movil_registrar(body: MovilRegistrar, x_app_key: str = Header(None)):
         dt = datetime.strptime(body.fecha, "%Y-%m-%d")
     except Exception:
         return {"ok": False, "mensaje": "Fecha inválida."}
-    fila = {"fecha": body.fecha, "anio": dt.year, "mes": dt.month, "dia": dt.day,
-            "sede": body.sede, "responsable": t["username"],
+    fila = {"nit": t["nit"], "fecha": body.fecha, "anio": dt.year, "mes": dt.month,
+            "dia": dt.day, "sede": body.sede, "responsable": t["username"],
             "observaciones": body.observaciones}
-    # La tabla rh1_diario tiene 'id' como PK SIN default; hay que enviarlo.
-    # ID determinístico y grande desde (fecha, sede): mantiene el mismo id al
-    # regrabar el mismo día/sede y no choca con los ids pequeños del escritorio.
+    # rh1_diario usa PK (nit, id) sin default; el id se deriva de (fecha, sede)
+    # para mantener el mismo registro al regrabar el día/sede.
     fila["id"] = 1_000_000_000 + int.from_bytes(
         hashlib.sha1(f"{body.fecha}|{body.sede}".encode()).digest()[:6], "big")
     for c in RESIDUO_COLS:
         fila[c] = float(body.valores.get(c, 0) or 0)
     try:
-        _sb("POST", "rh1_diario?on_conflict=fecha,sede", data=fila,
+        _sb("POST", "rh1_diario?on_conflict=nit,fecha,sede", data=fila,
             headers=_sb_headers({"Prefer": "resolution=merge-duplicates,return=minimal"}))
     except requests.HTTPError as e:
         raise HTTPException(502, f"No se pudo guardar: {e}")
@@ -638,8 +664,9 @@ def movil_estadisticas(body: MovilToken, x_app_key: str = Header(None)):
     if not t or t["role"] != "admin":
         raise HTTPException(403, "Solo administradores.")
     anio = datetime.now().year
+    nit = urllib.parse.quote(t["nit"])
     sel = ",".join(["sede", "fecha"] + RESIDUO_COLS)
-    rows = _sb("GET", f"rh1_diario?anio=eq.{anio}&select={sel}") or []
+    rows = _sb("GET", f"rh1_diario?nit=eq.{nit}&anio=eq.{anio}&select={sel}") or []
     por_sede = {}
     total_pel = total_nopel = 0.0
     pelig = {c for c, p in RESIDUOS if p}
@@ -665,7 +692,9 @@ def movil_usuarios(body: MovilToken, x_app_key: str = Header(None)):
     t = _validar_token(body.token)
     if not t or t["role"] != "admin":
         raise HTTPException(403, "Solo administradores.")
-    res = _sb("GET", "usuarios?select=username,nombre_completo,rol,activo,sede_asignada,bloqueado"
+    nit = urllib.parse.quote(t["nit"])
+    res = _sb("GET", f"usuarios?nit=eq.{nit}"
+                     "&select=username,nombre_completo,rol,activo,sede_asignada,bloqueado"
                      "&order=username") or []
     return {"ok": True, "usuarios": res}
 
@@ -676,7 +705,8 @@ def movil_bloquear(body: MovilBloquear, x_app_key: str = Header(None)):
     t = _validar_token(body.token)
     if not t or t["role"] != "admin":
         raise HTTPException(403, "Solo administradores.")
-    _sb("PATCH", f"usuarios?username=eq.{urllib.parse.quote(body.username)}",
+    nit = urllib.parse.quote(t["nit"])
+    _sb("PATCH", f"usuarios?nit=eq.{nit}&username=eq.{urllib.parse.quote(body.username)}",
         data={"bloqueado": 1 if body.bloquear else 0},
         headers=_sb_headers({"Prefer": "return=minimal"}))
     return {"ok": True, "mensaje": ("Usuario bloqueado." if body.bloquear else "Usuario desbloqueado.")}
@@ -881,21 +911,22 @@ def _dashboard_data(t):
 
     anio = datetime.now().year
     mes = datetime.now().month
+    nit = urllib.parse.quote(t["nit"])
     sel_rh1 = ",".join(["sede", "fecha", "mes"] + RESIDUO_COLS)
 
     pedidos = {
-        "rows": f"rh1_diario?anio=eq.{anio}&select={sel_rh1}",
-        "inds": "indicadores?select=id,codigo,nombre,unidad,meta,frecuencia&order=codigo",
-        "evals": "indicador_eval?select=indicador_id,fecha,periodo,resultado,cumple&order=fecha.desc",
-        "entregas": f"entregas?fecha=like.{anio}-*&select=num_certificado",
-        "cronograma": f"cronograma?anio=eq.{anio}&select=estado,plazo_fecha",
-        "contingencias": "contingencias?select=estado",
-        "gagas": "gagas_reuniones?select=fecha&order=fecha.desc&limit=1",
-        "presupuesto": f"presupuesto?anio=eq.{anio}&select=id,monto_asignado",
-        "gastos": f"gastos?anio=eq.{anio}&select=rubro_id,valor",
-        "usuarios": ("usuarios?select=username,nombre_completo,rol,activo,"
+        "rows": f"rh1_diario?nit=eq.{nit}&anio=eq.{anio}&select={sel_rh1}",
+        "inds": f"indicadores?nit=eq.{nit}&select=id,codigo,nombre,unidad,meta,frecuencia&order=codigo",
+        "evals": f"indicador_eval?nit=eq.{nit}&select=indicador_id,fecha,periodo,resultado,cumple&order=fecha.desc",
+        "entregas": f"entregas?nit=eq.{nit}&fecha=like.{anio}-*&select=num_certificado",
+        "cronograma": f"cronograma?nit=eq.{nit}&anio=eq.{anio}&select=estado,plazo_fecha",
+        "contingencias": f"contingencias?nit=eq.{nit}&select=estado",
+        "gagas": f"gagas_reuniones?nit=eq.{nit}&select=fecha&order=fecha.desc&limit=1",
+        "presupuesto": f"presupuesto?nit=eq.{nit}&anio=eq.{anio}&select=id,monto_asignado",
+        "gastos": f"gastos?nit=eq.{nit}&anio=eq.{anio}&select=rubro_id,valor",
+        "usuarios": (f"usuarios?nit=eq.{nit}&select=username,nombre_completo,rol,activo,"
                      "sede_asignada,bloqueado&order=username"),
-        "clientes": "clientes?select=razon_social&limit=1",
+        "clientes": f"clientes?nit=eq.{urllib.parse.quote(t['nit'])}&select=razon_social&limit=1",
     }
 
     def g(path):
