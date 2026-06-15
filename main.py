@@ -260,6 +260,7 @@ class Sync(BaseModel):
 class Restaurar(BaseModel):
     serial: str
     email: str
+    codigo: str = ""
     device_id: str = ""
     nombre_equipo: str = ""
 
@@ -285,6 +286,40 @@ def enviar_codigo(body: EnviarCodigo, x_app_key: str = Header(None)):
     except Exception as e:
         raise HTTPException(502, f"No se pudo enviar el correo: {e}")
     return {"ok": True, "mensaje": "Código enviado al correo."}
+
+
+def _enmascarar_email(email: str) -> str:
+    try:
+        u, d = email.split("@", 1)
+        u2 = (u[0] + "*") if len(u) <= 2 else (u[:2] + "***")
+        return f"{u2}@{d}"
+    except Exception:
+        return "tu correo registrado"
+
+
+@app.post("/licencia/enviar-codigo-serial")
+def enviar_codigo_serial(body: Estado, x_app_key: str = Header(None)):
+    """Envía el código al correo REGISTRADO de la licencia (no a uno cualquiera).
+
+    Se usa para 'Negocio existente': el usuario solo da la clave; el código va al
+    correo inscrito en esa licencia.
+    """
+    _auth(x_app_key)
+    serial = body.serial.strip()
+    cli = _sb("GET", f"clientes?serial_ref=eq.{urllib.parse.quote(serial)}"
+                     f"&select=email&limit=1")
+    if not cli or not (cli[0].get("email") or "").strip():
+        return {"ok": False, "mensaje": "Esta licencia no tiene un correo registrado."}
+    email = cli[0]["email"].strip()
+    codigo = f"{int.from_bytes(os.urandom(3), 'big') % 1000000:06d}"
+    _guardar_codigo(f"act:{email.lower()}", email, codigo)
+    try:
+        _enviar_correo(email, "Código de activación - PGIRASA Tools",
+                       f"Tu código de activación es: {codigo}\nVence en {CODIGO_TTL_MIN} minutos.",
+                       f"<h2>Activación PGIRASA</h2><p style='font-size:26px;font-weight:bold'>{codigo}</p>")
+    except Exception as e:
+        raise HTTPException(502, f"No se pudo enviar el correo: {e}")
+    return {"ok": True, "mensaje": f"Código enviado a {_enmascarar_email(email)}."}
 
 
 @app.post("/licencia/estado")
@@ -439,7 +474,6 @@ def datos_restaurar(body: Restaurar, x_app_key: str = Header(None)):
     """
     _auth(x_app_key)
     serial = body.serial.strip()
-    email = body.email.strip().lower()
 
     lic = _sb("GET", f"licencias?serial_compra=eq.{urllib.parse.quote(serial)}"
                      f"&select=serial_compra,limite_pcs")
@@ -449,8 +483,16 @@ def datos_restaurar(body: Restaurar, x_app_key: str = Header(None)):
                      f"&select=razon_social,email,nit&limit=1")
     if not cli:
         return {"ok": False, "mensaje": "Esta licencia aún no tiene un negocio registrado."}
-    if (cli[0].get("email") or "").strip().lower() != email:
-        return {"ok": False, "mensaje": "El correo no coincide con el de la licencia."}
+    # El correo y el código se validan contra el CORREO REGISTRADO de la licencia,
+    # no contra uno que escriba el usuario.
+    email = (cli[0].get("email") or "").strip().lower()
+    if not email:
+        return {"ok": False, "mensaje": "Esta licencia no tiene un correo registrado."}
+
+    # Verificar el código enviado a ese correo registrado.
+    err = _validar_codigo(f"act:{email}", email, body.codigo)
+    if err:
+        return {"ok": False, "mensaje": err}
 
     # Registrar el equipo (respeta el límite de equipos de la licencia).
     if body.device_id:
