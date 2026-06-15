@@ -18,10 +18,12 @@ from datetime import datetime, timedelta, date
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+import logging
+
 import bcrypt
 import requests
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import Response
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 # ── Configuración (variables de entorno en Coolify) ──────────────────────────
@@ -42,6 +44,28 @@ PAGO_MONTO         = int(os.getenv("PAGO_MONTO", "15000"))
 CODIGO_TTL_MIN     = 15
 
 app = FastAPI(title="PGIRASA Backend", version="1.0.0")
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("pgirasa")
+
+
+@app.exception_handler(Exception)
+async def _errores_no_controlados(request: Request, exc: Exception):
+    """En vez de un 500 mudo, registra el traceback y devuelve el detalle real.
+
+    Así, ante un fallo (p. ej. una escritura a Supabase), la app muestra la causa
+    y queda en los logs de Coolify para diagnosticar.
+    """
+    logger.exception("Error no controlado en %s %s", request.method, request.url.path)
+    detalle = f"{type(exc).__name__}: {exc}"
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        try:
+            detalle += f" | Supabase: {resp.text[:300]}"
+        except Exception:
+            pass
+    return JSONResponse(status_code=500, content={"detail": detalle})
 
 
 # ── Seguridad: clave compartida ──────────────────────────────────────────────
@@ -262,11 +286,13 @@ def estado(body: Estado, x_app_key: str = Header(None)):
     if not venc:
         return {"activa": False, "motivo": "Licencia sin fecha de vencimiento."}
     dias = (venc - datetime.now().date()).days
-    return {"activa": dias >= 0, "dias_restantes": dias,
+    # La licencia se inactiva al llegar a 0 días: hay que renovar el pago.
+    activa = dias > 0
+    return {"activa": activa, "dias_restantes": dias,
             "vencimiento": venc.strftime("%Y-%m-%d"),
             "plan": lic.get("tipo_licencia") or "Mensual",
             "precio": int(lic.get("precio") or PAGO_MONTO),
-            "motivo": "" if dias >= 0 else "La licencia está vencida."}
+            "motivo": "" if activa else "La licencia venció. Renueva el pago para continuar."}
 
 
 @app.post("/licencia/activar")
