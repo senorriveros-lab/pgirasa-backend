@@ -207,8 +207,15 @@ def _validar_codigo(clave, email, codigo):
     if not res:
         return "Primero solicita un código."
     d = res[0]
-    if _parse_fecha(d["exp"]) and datetime.fromisoformat(d["exp"]) < datetime.now():
-        return "El código expiró. Solicita uno nuevo."
+    # Supabase puede devolver 'exp' con zona horaria (timestamptz). Se compara de
+    # forma segura: si la fecha es "aware", se usa un ahora también "aware".
+    try:
+        exp_dt = datetime.fromisoformat(str(d["exp"]).replace("Z", "+00:00"))
+        ahora = datetime.now(exp_dt.tzinfo) if exp_dt.tzinfo else datetime.now()
+        if exp_dt < ahora:
+            return "El código expiró. Solicita uno nuevo."
+    except Exception:
+        pass  # si no se puede parsear la fecha, no se bloquea por expiración
     if email.lower() != d.get("email"):
         return "El correo no coincide con el del código."
     if hashlib.sha256(codigo.encode()).hexdigest() != d["hash"]:
@@ -249,6 +256,12 @@ class Sync(BaseModel):
     tabla: str
     on_conflict: str = ""
     filas: list
+
+class Restaurar(BaseModel):
+    serial: str
+    email: str
+    device_id: str = ""
+    nombre_equipo: str = ""
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
@@ -393,6 +406,65 @@ def datos_sync(body: Sync, x_app_key: str = Header(None)):
     except requests.HTTPError as e:
         raise HTTPException(502, f"Error al sincronizar {body.tabla}: {e}")
     return {"ok": True, "filas": len(body.filas)}
+
+
+# Tablas del negocio que se restauran al "Negocio Existente" (sin BLOBs/archivos).
+TABLAS_RESTAURABLES = [
+    "ajustes", "sedes", "usuarios", "rh1_diario", "entregas", "gastos",
+    "presupuesto", "indicadores", "indicador_eval", "capacitaciones",
+    "contingencias", "cronograma", "gagas_miembros", "gagas_reuniones",
+    "auditoria",
+]
+
+
+@app.post("/datos/restaurar")
+def datos_restaurar(body: Restaurar, x_app_key: str = Header(None)):
+    """Restaura un negocio existente en un equipo nuevo.
+
+    Valida la licencia y que el correo coincida con el registrado, registra el
+    equipo (respetando el límite) y devuelve todos los datos del negocio para
+    escribirlos en la base local.
+    """
+    _auth(x_app_key)
+    serial = body.serial.strip()
+    email = body.email.strip().lower()
+
+    lic = _sb("GET", f"licencias?serial_compra=eq.{urllib.parse.quote(serial)}"
+                     f"&select=serial_compra,limite_pcs")
+    if not lic:
+        return {"ok": False, "mensaje": "La clave de licencia no existe."}
+    cli = _sb("GET", f"clientes?serial_ref=eq.{urllib.parse.quote(serial)}"
+                     f"&select=razon_social,email,nit&limit=1")
+    if not cli:
+        return {"ok": False, "mensaje": "Esta licencia aún no tiene un negocio registrado."}
+    if (cli[0].get("email") or "").strip().lower() != email:
+        return {"ok": False, "mensaje": "El correo no coincide con el de la licencia."}
+
+    # Registrar el equipo (respeta el límite de equipos de la licencia).
+    if body.device_id:
+        limite = int(lic[0].get("limite_pcs") or 2)
+        equipos = _sb("GET", f"equipos?serial_ref=eq.{urllib.parse.quote(serial)}"
+                             f"&select=device_id") or []
+        ids = [e.get("device_id") for e in equipos]
+        if body.device_id not in ids:
+            if len(ids) >= limite:
+                return {"ok": False,
+                        "mensaje": f"Esta licencia ya está en uso en {limite} equipos."}
+            _sb("POST", "equipos",
+                data={"serial_ref": serial, "device_id": body.device_id,
+                      "nombre_equipo": body.nombre_equipo,
+                      "registrado_en": datetime.now().isoformat()},
+                headers=_sb_headers({"Prefer": "return=minimal"}))
+
+    # Descargar todas las tablas del negocio.
+    tablas = {}
+    for t in TABLAS_RESTAURABLES:
+        try:
+            tablas[t] = _sb("GET", f"{t}?select=*") or []
+        except Exception:
+            tablas[t] = []
+    return {"ok": True, "entidad": cli[0].get("razon_social", ""),
+            "nit": cli[0].get("nit", ""), "tablas": tablas}
 
 
 # ============================================================
