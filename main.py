@@ -259,7 +259,7 @@ class Sync(BaseModel):
 
 class Restaurar(BaseModel):
     serial: str
-    email: str
+    email: str = ""          # ya no se usa: el correo se toma del registrado en la licencia
     codigo: str = ""
     device_id: str = ""
     nombre_equipo: str = ""
